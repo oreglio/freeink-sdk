@@ -281,14 +281,20 @@ void list(Frame<MaxInteractions> &frame, Rect rect, const ListProps &props) {
       continue;
     }
     // Per-item height: a label that must wrap (maxLines > 1 and wider than
-    // its slot) grows by exactly its extra text lines, keeping the same
-    // vertical padding a single-line row carries — while every other row
-    // keeps the uniform rowH. Only when the wrapped lines would not already
-    // fit rowH (dense e-ink rows), so touch-sized rows are unaffected.
+    // its slot) grows by exactly the extra text lines it USES — measured, not
+    // maxLines: a two-line title in a three-line budget costs one extra line,
+    // not two — keeping the same vertical padding a single-line row carries,
+    // while every other row keeps the uniform rowH. Rows with a subtitle grow
+    // the same way: the label band takes its wrapped lines and the subtitle
+    // moves below them. Label-only rows keep the "would maxLines already fit
+    // rowH" gate, so touch-sized rows stay unaffected; a subtitle row's rowH
+    // is sized for one label line by construction, so any wrap grows it.
     int16_t itemH = rowH;
+    uint8_t labelLines = 1;
     const int16_t wrapLh = frame.target().lineHeight(props.labelText.font);
-    if (item.label && !item.subtitle && props.labelText.maxLines > 1 &&
-        static_cast<int16_t>(wrapLh * props.labelText.maxLines) > rowH) {
+    if (item.label && props.labelText.maxLines > 1 &&
+        (item.subtitle != nullptr ||
+         static_cast<int16_t>(wrapLh * props.labelText.maxLines) > rowH)) {
       int16_t labelAvail = static_cast<int16_t>(rowArea.width - sidePad * 2);
       if (item.icon || item.iconAsset) {
         const BitmapRef ic = item.icon
@@ -312,10 +318,21 @@ void list(Frame<MaxInteractions> &frame, Rect rect, const ListProps &props) {
                 .width -
             props.valueInset - props.textGap);
       }
-      if (frame.target()
-              .measureText(props.labelText.font, item.label, props.labelText)
-              .width > labelAvail) {
-        itemH = static_cast<int16_t>(rowH + wrapLh * (props.labelText.maxLines - 1));
+      // The cheap single-line width check gates the full wrap layout, so
+      // rows whose label fits pay one measure and nothing else.
+      if (labelAvail > 0 &&
+          frame.target()
+                  .measureText(props.labelText.font, item.label,
+                               props.labelText)
+                  .width > labelAvail) {
+        const Size wrapped = measureWrappedText(
+            frame.target(), item.label, props.labelText, labelAvail);
+        const int16_t lines =
+            wrapLh > 0 ? static_cast<int16_t>(wrapped.height / wrapLh) : 1;
+        if (lines > 1) {
+          labelLines = static_cast<uint8_t>(lines);
+          itemH = static_cast<int16_t>(rowH + wrapLh * (lines - 1));
+        }
       }
     }
     if (static_cast<int16_t>(cursorY + itemH) > rowArea.bottom() ||
@@ -370,15 +387,18 @@ void list(Frame<MaxInteractions> &frame, Rect rect, const ListProps &props) {
     TextStyle labelStyle =
         textStyleWithForeground(props.labelText, style.foreground);
     const int16_t labelH = frame.target().lineHeight(labelStyle.font);
+    // The band holds every label line the height pre-pass measured (usually
+    // one); the subtitle and the row's growth both follow it.
+    const int16_t labelBlockH = static_cast<int16_t>(labelH * labelLines);
     const int16_t subH =
         item.subtitle ? frame.target().lineHeight(props.subtitleText.font) : 0;
     Rect band = content;
     if (item.subtitle) {
       int16_t bandTop = static_cast<int16_t>(
-          content.y + (content.height - labelH - subH) / 2);
+          content.y + (content.height - labelBlockH - subH) / 2);
       if (bandTop < content.y)
         bandTop = content.y;
-      band = Rect{content.x, bandTop, content.width, labelH};
+      band = Rect{content.x, bandTop, content.width, labelBlockH};
     }
 
     const BitmapRef icon =
@@ -474,8 +494,8 @@ void list(Frame<MaxInteractions> &frame, Rect rect, const ListProps &props) {
       frame.target().text(Rect{band.x, band.y, availW, band.height}, item.label,
                           labelStyle);
       frame.target().text(
-          Rect{content.x, static_cast<int16_t>(band.y + labelH), content.width,
-               subH},
+          Rect{content.x, static_cast<int16_t>(band.y + band.height),
+               content.width, subH},
           item.subtitle,
           textStyleWithForeground(props.subtitleText, style.foreground));
     } else {
