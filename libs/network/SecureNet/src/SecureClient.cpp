@@ -85,8 +85,14 @@ int SecureClient::connectWithMethod(const char* host, uint16_t port, void* metho
   if (_insecure) {
     wolfSSL_CTX_set_verify(ctx, WOLFSSL_VERIFY_NONE, nullptr);
   } else if (_rootCA) {
-    wolfSSL_CTX_load_verify_buffer(ctx, reinterpret_cast<const unsigned char*>(_rootCA),
-                                   strlen(_rootCA), WOLFSSL_FILETYPE_PEM);
+    // Unchecked, this failure is invisible and surfaces later as an opaque
+    // ASN_NO_SIGNER handshake error. Seen on X3: the system clock still at the
+    // 1970 epoch makes every certificate "not yet valid" (ASN_BEFORE_DATE_E).
+    const int caRet = wolfSSL_CTX_load_verify_buffer(ctx, reinterpret_cast<const unsigned char*>(_rootCA),
+                                                     strlen(_rootCA), WOLFSSL_FILETYPE_PEM);
+    if (caRet != WOLFSSL_SUCCESS && Serial) {
+      Serial.printf("[SecureClient] load_verify_buffer failed ret=%d\n", caRet);
+    }
   }
   wolfSSL_SetIORecv(ctx, wcRecv);
   wolfSSL_SetIOSend(ctx, wcSend);
