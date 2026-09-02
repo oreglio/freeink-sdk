@@ -775,6 +775,47 @@ void testListInlineSectionHeadingDoesNotOrphan() {
   CHECK_EQ(draw.countKind(FakeDrawTarget::Op::Text), 0u);
 }
 
+// A fixed-height estimate can say every logical row fits even though inline
+// headings make the real layout span multiple pages. A nav-managed virtual
+// window must keep its absolute page top instead of silently resetting to 0.
+void testListNavKeepsVirtualPageTopWithInlineHeadings() {
+  FakeDrawTarget draw;
+  DeviceContext device = makeDevice();
+  InputSnapshot input;
+  InteractionBuffer<8> interactions;
+  Frame<8> frame(draw, device, input, interactions);
+
+  // Absolute rows 2..5 of a six-book list. Six plain 20px rows fit in the
+  // 120px viewport, but each inline heading makes only two books fit.
+  ListItem window[4]{};
+  for (int i = 0; i < 4; ++i) {
+    window[i].label = "Book";
+    window[i].sectionHeading = "Author";
+    window[i].actionValue = static_cast<int16_t>(i + 2);
+  }
+
+  ListNav nav;
+  nav.top = 2;
+  ListProps props;
+  props.items = window;
+  props.itemsWindowFirst = 2;
+  props.itemsWindowCount = 4;
+  props.count = 6;
+  props.topIndex = 2;
+  props.action = 9;
+  props.rowHeight = 20;
+  props.rowGap = 0;
+  props.headerUnderline = false;
+  props.nav = &nav;
+  list(frame, Rect{0, 0, 480, 120}, props);
+
+  CHECK_EQ(interactions.count(), 2u);
+  CHECK_EQ(interactions.data()[0].value, 2);
+  CHECK_EQ(interactions.data()[1].value, 3);
+  CHECK_EQ(nav.top, 2);
+  CHECK_EQ(nav.drawnRows, 2);
+}
+
 void testListNavLayoutFeedback() {
   FakeDrawTarget draw;
   DeviceContext device = makeDevice();
@@ -3176,6 +3217,7 @@ int main() {
   testListItemsWindowSkipsUnavailablePartialPreview();
   testListInlineSectionHeadingWindow();
   testListInlineSectionHeadingDoesNotOrphan();
+  testListNavKeepsVirtualPageTopWithInlineHeadings();
   testListNavLayoutFeedback();
   testListNavConvergesThroughRealList();
   testListCanUseFullTitleWidthWithShortValue();

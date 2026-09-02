@@ -324,7 +324,11 @@ void list(Frame<MaxInteractions> &frame, Rect rect, const ListProps &props) {
   // of converging).
   if (overflows && !props.nav && top > props.count - visible)
     top = static_cast<uint16_t>(props.count - visible);
-  if (!overflows)
+  // Inline headings and wrapped content can make the measured page overflow
+  // even when every logical row fits the fixed-height estimate. Preserve the
+  // measured viewport owned by ListNav; resetting it would put `top` before a
+  // virtual window and render an empty page.
+  if (!overflows && !props.nav)
     top = 0;
   const uint16_t end =
       overflows ? static_cast<uint16_t>(top + visible) : props.count;
