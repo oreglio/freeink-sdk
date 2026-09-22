@@ -25,6 +25,13 @@ struct ListItem {
   // It shares the row's logical index and interaction value. Kept last so
   // existing aggregate initializers remain source-compatible.
   const char *sectionHeading = nullptr;
+  // Visual emphasis for this row's label only (e.g. a high-priority task, an
+  // unread or favorited entry), layered onto whatever labelText already
+  // carries -- it never turns emphasis off, only on, so rows that don't set
+  // it render exactly as before. Does not affect row height or wrapping:
+  // geometry is measured from the shared labelText, never per-row. Kept
+  // last for the same aggregate-initializer reason as sectionHeading above.
+  bool emphasis = false;
 };
 
 struct ListNav;
@@ -610,6 +617,8 @@ void list(Frame<MaxInteractions> &frame, Rect rect, const ListProps &props) {
     // under the band so it never collides with the value.
     TextStyle labelStyle =
         textStyleWithForeground(props.labelText, style.foreground);
+    if (item.emphasis)
+      labelStyle.bold = true;
     const int16_t labelH = frame.target().lineHeight(labelStyle.font);
     // The band holds every label line the height pre-pass measured (usually
     // one); the subtitle and the row's growth both follow it.
@@ -838,6 +847,8 @@ void list(Frame<MaxInteractions> &frame, Rect rect, const ListProps &props) {
         Rect content = row.inset(Insets{0, sidePad, 0, sidePad});
         TextStyle labelStyle =
             textStyleWithForeground(props.labelText, style.foreground);
+        if (item.emphasis)
+          labelStyle.bold = true;
         labelStyle.maxLines = 1;
         TextStyle subtitleStyle =
             textStyleWithForeground(props.subtitleText, style.foreground);
