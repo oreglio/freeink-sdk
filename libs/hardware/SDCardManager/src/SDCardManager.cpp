@@ -11,6 +11,9 @@
 #if FREEINK_DEVICE_PAPERMONO
 #include <PaperMonoBoard.h>
 #endif
+#if FREEINK_DEVICE_EEGO_A4
+#include <Wire.h>
+#endif
 
 SDCardManager SDCardManager::instance;
 
@@ -19,6 +22,9 @@ SDCardManager::SDCardManager() {}
 
 bool SDCardManager::begin() {
   if (initialized) return true;
+#if FREEINK_DEVICE_METALIO_EINK4
+  if (BoardConfig::isMetalioEInk4() && !freeink::metalio::ensureBooted()) return false;
+#endif
 
   // Native SDMMC: SdFat can't drive SDIO, so mount a plain FsVolume on the esp-idf
   // SDMMC block device. FsFile from this volume is the same type the SPI path
@@ -53,7 +59,17 @@ bool SDCardManager::begin() {
     return false;
   }
   if (!_vol.begin(_dev)) {
-    if (Serial) Serial.printf("[%lu] [SD] SDMMC volume mount failed\n", millis());
+    if (Serial) {
+      // Which read failed: the MBR, or the first partition's boot sector.
+      static uint8_t sec[512];
+      const bool mbrOk = _dev->readSector(0, sec);
+      const uint32_t lba = mbrOk ? (sec[454] | sec[455] << 8 | sec[456] << 16 | uint32_t(sec[457]) << 24) : 0;
+      const uint8_t type = mbrOk ? sec[450] : 0;
+      const bool sig = mbrOk && sec[510] == 0x55 && sec[511] == 0xAA;
+      const bool bootOk = mbrOk && lba != 0 && _dev->readSector(lba, sec);
+      Serial.printf("[%lu] [SD] SDMMC volume mount failed (mbr read=%d sig=%d p1 type=0x%02X lba=%lu read=%d)\n",
+                    millis(), mbrOk, sig, type, static_cast<unsigned long>(lba), bootOk);
+    }
     initialized = false;
     cachedTotalBytes = 0;
     cachedUsedBytesValid = false;
@@ -130,6 +146,34 @@ bool SDCardManager::begin() {
   const uint32_t SPI_FQ = BoardConfig::ACTIVE.sd.spiHz != 0 ? BoardConfig::ACTIVE.sd.spiHz : 40000000;
 
   if (_powerHook) _powerHook();  // board brings up its SD rail (e.g. PMIC) if needed
+
+#if FREEINK_DEVICE_EEGO_A4
+  // EEGO A4 revisions differ on GPIO6. Units whose CW2015 gauge answers use it as
+  // the SD card's active-low power enable (stock V1.0.3 logs "SD power enabled:
+  // GPIO6 active-low"); held HIGH, their card does not answer. Units without the
+  // gauge read the battery on the GPIO10 ADC only with GPIO6 HIGH, which the
+  // profile leaves to display initialization. Decided once, before SD and display
+  // initialization drive the pin.
+  if (BoardConfig::isEegoA4()) {
+    static bool decided = false;
+    const int8_t gpio6 = BoardConfig::ACTIVE.display.powerEnable;
+    if (!decided && gpio6 >= 0) {
+      decided = true;
+      const auto& g = BoardConfig::ACTIVE.batteryGauge;
+      Wire.begin(g.i2cSda, g.i2cScl, g.i2cHz);
+      Wire.beginTransmission(g.gaugeAddr);
+      const bool gauge = Wire.endTransmission() == 0;
+      if (gauge) {
+        BoardConfig::ACTIVE.sd.powerEnable = gpio6;
+        BoardConfig::ACTIVE.sd.powerActiveHigh = false;
+        BoardConfig::ACTIVE.display.powerEnable = BoardConfig::PIN_UNASSIGNED;
+      }
+      if (Serial)
+        Serial.printf("[%lu] [SD] EEGO A4: CW2015 %s, GPIO%d = %s\n", millis(), gauge ? "present" : "absent", gpio6,
+                      gauge ? "SD power (active-low)" : "display enable (HIGH)");
+    }
+  }
+#endif
 
   // Boards that gate the SD rail with a plain GPIO (e.g. Sticky's SD_PWR_EN on
   // GPIO10) must power it before probing. Active-high enable + a brief settle.
@@ -332,20 +376,36 @@ bool SDCardManager::readFileToStream(const char* path, Print& out, const size_t 
   const bool watchdogWatchesThisTask = (esp_task_wdt_status(nullptr) == ESP_OK);
   uint32_t lastYieldMs = millis();
 
-  while (f.available()) {
-    const int r = f.read(buf, toRead);
+  uint64_t remaining = f.fileSize();
+  while (remaining > 0) {
+    const size_t want = remaining < toRead ? static_cast<size_t>(remaining) : toRead;
+    const int r = f.read(buf, want);
     if (r <= 0) {
-      break;
+      if (Serial) Serial.printf("SDCardManager: incomplete read of %s\n", path);
+      f.close();
+      return false;
     }
-    out.write(buf, static_cast<size_t>(r));
 
-    if (millis() - lastYieldMs >= yieldIntervalMs) {
-      if (watchdogWatchesThisTask) {
-        esp_task_wdt_reset();
+    const size_t count = static_cast<size_t>(r);
+    size_t sent = 0;
+    while (sent < count) {
+      const size_t written = out.write(buf + sent, count - sent);
+      if (written == 0 || written > count - sent) {
+        if (Serial) Serial.printf("SDCardManager: incomplete write while streaming %s\n", path);
+        f.close();
+        return false;
       }
-      vTaskDelay(1);  // let every other task on this core run
-      lastYieldMs = millis();
+      sent += written;
+
+      if (millis() - lastYieldMs >= yieldIntervalMs) {
+        if (watchdogWatchesThisTask) {
+          esp_task_wdt_reset();
+        }
+        vTaskDelay(1);  // let every other task on this core run
+        lastYieldMs = millis();
+      }
     }
+    remaining -= count;
   }
 
   f.close();
@@ -393,19 +453,28 @@ bool SDCardManager::writeFile(const char* path, const String& content) {
     return false;
   }
 
-  if (vol().exists(path)) {
-    vol().remove(path);
-  }
-
+  // Write beside the target and swap in only a complete copy: a short write or
+  // failed flush leaves the previous file untouched, never a truncated one.
+  const String tmp = String(path) + ".tmp";
   FsFile f;
-  if (!openFileForWrite("SD", path, f)) {
-    if (Serial) Serial.printf("Failed to open file for write: %s\n", path);
+  if (!openFileForWrite("SD", tmp.c_str(), f)) {
+    if (Serial) Serial.printf("Failed to open file for write: %s\n", tmp.c_str());
+    return false;
+  }
+  const bool complete = f.print(content) == content.length();
+  if (!f.close() || !complete) {
+    if (Serial) Serial.printf("Short write, keeping previous %s\n", path);
+    vol().remove(tmp.c_str());
     return false;
   }
 
-  const size_t written = f.print(content);
-  f.close();
-  return written == content.length();
+  // ponytail: a power cut between replaceFile's remove and rename leaves only
+  // the complete .tmp; recover it on read if that window ever matters.
+  if (!replaceFile(tmp.c_str(), path)) {
+    vol().remove(tmp.c_str());
+    return false;
+  }
+  return true;
 }
 
 bool SDCardManager::ensureDirectoryExists(const char* path) {

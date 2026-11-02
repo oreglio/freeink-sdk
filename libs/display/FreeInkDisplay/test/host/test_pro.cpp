@@ -8,6 +8,7 @@
 #define private public
 #include "FreeInkDisplay.h"
 #include "src/driver/Ssd1677Driver.h"
+#include "src/lut/Ssd1677Luts.h"
 #include "src/driver/Uc8179Driver.h"
 #include "src/driver/Uc8279X4Driver.h"
 #undef private
@@ -20,6 +21,14 @@ static uint8_t lastRegister(const EpdBus& bus, uint8_t command) {
     if (i->command == command && !i->bytes.empty()) return i->bytes[0];
   assert(false);
   return 0;
+}
+
+static const Bytes& lastPlane(const EpdBus& bus, uint8_t command) {
+  for (auto i = bus.writes.rbegin(); i != bus.writes.rend(); ++i)
+    if (i->command == command) return i->bytes;
+  assert(false);
+  static const Bytes empty;
+  return empty;
 }
 
 static Bytes frame(unsigned seed) {
@@ -161,6 +170,59 @@ static void testAsyncFrame() {
   display.releaseBuffers();
   free(driver._grayBase);
 }
+
+#ifndef EINK_DISPLAY_SINGLE_BUFFER_MODE
+// cleanupGrayscaleWithPreviousBuffer() only ever runs at the tail (or abort point) of a
+// grayscale plane pass, and those passes use the write framebuffer as plane scratch. So
+// frameBufferActive is the only thing that can be the displayed B/W frame: with the secondary
+// away the driver must be told there is no baseline, never handed the plane. Handing it over
+// rebases the controller's previous-frame RAM from the page's own glyph plane.
+static void testGrayCleanupBaseline() {
+  const auto page = frame(51), planeScratch = frame(77);
+
+  // Secondary resident: the displayed frame is the baseline, and the write buffer is restored
+  // from it so the next B/W draw starts from a real frame rather than plane bytes.
+  {
+    Uc8279X4Driver driver;
+    FreeInkDisplay display(12, 11, 13, 18, 14, 6);
+    display._driver = &driver;
+    display.begin();
+    std::memcpy(display.getFrameBuffer(), page.data(), page.size());
+    display.displayBuffer(FreeInkDisplay::FAST_REFRESH);  // swaps: frameBufferActive == page
+    std::memcpy(display.getFrameBuffer(), planeScratch.data(), planeScratch.size());
+    display._bus.clear();
+    display.cleanupGrayscaleWithPreviousBuffer();
+    assert(std::count_if(display._bus.writes.begin(), display._bus.writes.end(),
+                         [](const auto& w) { return w.command == 0x10; }) == 1);
+    assert(driver._oldPlaneValid);
+    assert(std::equal(page.begin(), page.end(), display.getFrameBuffer()));
+    display.releaseBuffers();
+    free(driver._grayBase);
+  }
+
+  // Secondary released, then lent: in both cases no copy of the displayed frame exists, so
+  // nothing may be streamed into controller RAM and the driver must fall back to a clean sync.
+  for (bool lend : {false, true}) {
+    Uc8279X4Driver driver;
+    FreeInkDisplay display(12, 11, 13, 18, 14, 6);
+    display._driver = &driver;
+    display.begin();
+    std::memcpy(display.getFrameBuffer(), page.data(), page.size());
+    display.displayBuffer(FreeInkDisplay::FAST_REFRESH);
+    assert(driver._oldPlaneValid);
+    if (lend) assert(display.borrowSecondaryBuffer(nullptr) != nullptr);
+    else assert(display.releaseSecondaryBuffer());
+    std::memcpy(display.getFrameBuffer(), planeScratch.data(), planeScratch.size());
+    display._bus.clear();
+    display.cleanupGrayscaleWithPreviousBuffer();
+    for (const auto& w : display._bus.writes) assert(w.command != 0x10 && w.command != 0x13);
+    assert(driver._needFullClear && !driver._oldPlaneValid);
+    if (lend) assert(display.returnSecondaryBuffer());
+    display.releaseBuffers();
+    free(driver._grayBase);
+  }
+}
+#endif
 
 // A driver with no grayscale implementation must never advertise support.
 class BwOnlyDriver : public PanelDriver {
@@ -533,7 +595,82 @@ static void testStickyAbsolute() {
   display.releaseBuffers();
 }
 
-int main(int argc, char**) {
+static void testMetalio() {
+  BoardConfig::ACTIVE.board = BoardConfig::Board::MetalioEInk4;
+  auto& driver = static_cast<Ssd1677Driver&>(ssd1677Driver());
+  EpdBus bus;
+  driver.begin(bus);
+  assert(lastRegister(bus, 0x3C) == 0x01);
+  assert(driver.grayscaleCapabilities(GrayscaleMode::Absolute).supported());
+  assert(driver.grayscaleCapabilities().supported());
+  const auto bw = frame(42);
+  bus.clear();
+  // Cold FAST uses the demo's two-partial black pulse, never OTP D7. Both
+  // phases run the vendor B/W fast LUT (0xCC activation, no OTP 0xFC).
+  driver.display(bus, bw.data(), nullptr, RefreshMode::Fast, false);
+  assert(lastRegister(bus, 0x22) == 0xCC);
+  unsigned activations = 0;
+  std::vector<Bytes> oldPlanes;
+  for (const auto& w : bus.writes) {
+    if (w.command == 0x20) ++activations;
+    if (w.command == 0x26) oldPlanes.push_back(w.bytes);
+    if (w.command == 0x22) assert(w.bytes == Bytes({0xCC}));
+    if (w.command == 0x32) assert(w.bytes == Bytes(lut_fast_metalio, lut_fast_metalio + 105));
+    assert(w.command != 0x1A);
+  }
+  assert(activations == 2 && bus.waits == 2);
+  assert(oldPlanes.size() == 3);
+  assert(oldPlanes[0] == Bytes(bw.size(), 0xFF));
+  assert(oldPlanes[1] == Bytes(bw.size(), 0x00));
+  assert(oldPlanes[2] == bw);
+  assert(!driver._customLutActive);
+  bus.clear();
+  driver.display(bus, bw.data(), nullptr, RefreshMode::Fast, false);
+  assert(lastRegister(bus, 0x22) == 0xCC);
+  assert(lastRegister(bus, 0x18) == 0x80);
+  assert(lastRegister(bus, 0x3C) == 0x80);
+  assert(lastRegister(bus, 0x2C) == 0x10);
+  for (const auto& w : bus.writes) if (w.command == 0x21) assert(w.bytes == Bytes({0, 0}));
+  assert(driver._isScreenOn);
+  bus.clear();
+  driver.displayGray(bus, bw.data(), false, nullptr, false);
+  // X4 external-LUT AA path: LUT + voltage tail written, border parked at 0xC0,
+  // absolute 0xCC activation.
+  assert(lastRegister(bus, 0x22) == 0xCC);
+  assert(lastRegister(bus, 0x3C) == 0xC0);
+  bool lutWritten = false;
+  for (const auto& w : bus.writes) if (w.command == 0x32) lutWritten = true;
+  assert(lutWritten);
+  // Exit grayscale the way the facade does so the next FAST isn't promoted.
+  driver.cleanupGrayscaleBuffers(bus, bw.data());
+  bus.clear();
+  driver.displayStart(bus, bw.data(), bw.data(), RefreshMode::Fast, true);
+  assert(lastRegister(bus, 0x22) == 0xCF);  // LUT paint, then analog/clock off
+  driver.displayFinish(bus, bw.data());
+  assert(lastRegister(bus, 0x22) == 0xCF);
+  assert(!driver._isScreenOn);
+  // Deferred FAST must resync both planes from the frame retained by the facade.
+  assert(lastPlane(bus, 0x24) == bw && lastPlane(bus, 0x26) == bw);
+  bus.clear();
+  driver.displayStart(bus, bw.data(), nullptr, RefreshMode::Half, true);
+  assert(bus.waits == 1);  // black pulse done; target waveform still pending
+  unsigned pulses = 0;
+  for (const auto& w : bus.writes) if (w.command == 0x20) ++pulses;
+  assert(pulses == 2);
+  assert(lastPlane(bus, 0x26) == Bytes(bw.size(), 0));
+  driver.displayFinish(bus, bw.data());
+  assert(lastPlane(bus, 0x26) == bw && lastPlane(bus, 0x24) == bw);
+  assert(lastRegister(bus, 0x22) == 0xCF);
+  driver.deepSleep(bus);
+  assert(lastRegister(bus, 0x10) == 0x03);
+}
+
+int main(int argc, char** argv) {
+  if (argc > 1 && std::strcmp(argv[1], "metalio") == 0) {
+    testMetalio();
+    std::puts("Metalio refresh, temperature, grayscale fallback and async power-down passed");
+    return 0;
+  }
   if (argc > 1) {
     testStickyAbsolute();
     std::puts("Sticky absolute capability, activation, power-down and B/W recovery passed");
@@ -555,5 +692,8 @@ int main(int argc, char**) {
   testSsd();
   testAsyncFrame<Uc8179Driver>();
   testAsyncFrame<Uc8279X4Driver>();
+#ifndef EINK_DISPLAY_SINGLE_BUFFER_MODE
+  testGrayCleanupBaseline();
+#endif
   std::puts("Pro plane bytes, transaction counts, clean refreshes, power state and async frame ownership passed");
 }

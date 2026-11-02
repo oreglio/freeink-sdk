@@ -2,6 +2,7 @@
 #include <cstddef>
 #include <cstring>
 #include <string>
+#include <vector>
 
 /**
  * Type of OPDS entry.
@@ -35,6 +36,17 @@ struct OpdsEntry {
   // Publication "self" link (application/opds-publication+json): fetched to
   // build the detail page. Empty when the feed offers none.
   std::string selfHref;
+  // Feed-inline description (Atom summary/content), tags stripped and capped
+  // at MAX_DESCRIPTION_CHARS. OPDS 1.x has no per-publication document, so
+  // this is the detail page's only description source there.
+  std::string description;
+  // The chosen acquisition href is an LCP license document (.lcpl,
+  // application/vnd.readium.lcp.license.v1.0+json): download the license,
+  // then fulfill it into an EPUB through the LCP fulfillment service.
+  bool lcpLicense = false;
+  // Feed-inline cover art href (OPDS 2.0 `images`, OPDS 1.x image rel links);
+  // the detail page's cover source when the publication has no self document.
+  std::string coverHref;
 };
 
 // Entry id marking a group's "see all" link; the UI supplies the label.
@@ -74,4 +86,18 @@ constexpr size_t MAX_HREF_CHARS = 768;
 constexpr size_t MAX_SEARCH_TEMPLATE_CHARS = 768;
 constexpr size_t MAX_PAGE_URL_CHARS = 768;
 constexpr size_t MAX_FACET_ENTRIES = 24;
+// Per-entry description cap: enough for the detail page's visible lines while
+// bounding worst-case feed RAM (MAX_ENTRIES * this).
+constexpr size_t MAX_DESCRIPTION_CHARS = 500;
+
+// A parser is created once the response is flowing, when TLS has split the heap.
+// These size a vector to the largest free block instead of reserving the full
+// capacity, which aborts when it does not fit. Callers stop appending at
+// capacity(), so parsing never reallocates.
+//
+// Reserves up to ENTRY_STORAGE_CAPACITY entries and returns the entry limit,
+// keeping the MAX_ENTRIES margin; 0 when not even a few rows fit.
+size_t reserveFeedEntries(std::vector<OpdsEntry>& entries);
+// Reserves up to MAX_FACET_ENTRIES facet rows (possibly none).
+void reserveFacetEntries(std::vector<OpdsEntry>& facets);
 }  // namespace OpdsLimits
