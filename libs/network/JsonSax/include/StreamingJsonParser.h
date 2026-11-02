@@ -37,6 +37,13 @@ class StreamingJsonParser {
 
   bool hasError() const { return error; }
 
+  // A field longer than TOKEN_BUF_SIZE raises no error: the token is dropped and
+  // emitToken() calls no value callback for it, so validation written in a value
+  // callback never sees it and cannot reject it. A consumer that cares must ask
+  // here. Sticky until reset(): the overflow may hit a field the consumer
+  // ignores, in the middle of an otherwise valid line.
+  bool tokenTruncated() const { return sawTokenOverflow; }
+
  private:
   enum class State : uint8_t {
     SCANNING,
@@ -74,6 +81,7 @@ class StreamingJsonParser {
   bool expectingValue;
   bool escaped;
   bool tokenOverflow;
+  bool sawTokenOverflow;
   bool error;
 
   Container nestingStack[MAX_NESTING];

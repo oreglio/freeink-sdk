@@ -10,6 +10,7 @@ void StreamingJsonParser::reset() {
   expectingValue = false;
   escaped = false;
   tokenOverflow = false;
+  sawTokenOverflow = false;
   error = false;
   nestingDepth = 0;
   literalLen = 0;
@@ -301,6 +302,7 @@ void StreamingJsonParser::appendToken(char c) {
     tokenBuf[tokenLen++] = c;
   } else {
     tokenOverflow = true;
+    sawTokenOverflow = true;
   }
 }
 
